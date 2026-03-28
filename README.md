@@ -1,17 +1,53 @@
-**Tunisia *Klebsiella pneumoniae* WGS Metadata**
-**Description**
+**Tunisia *Klebsiella pneumoniae* WGS Data and Code Repository**
 
-This repository contains de-identified metadata associated with whole-genome sequencing (WGS) of third-generation cephalosporin-resistant Klebsiella pneumoniae isolates collected through the Tunisian Antimicrobial Resistance Surveillance System (TARSS).
+## Description
 
-The dataset accompanies genomic analyses presented in the PhD thesis at London School of Hygiene & Tropical Medicine and related manuscripts.
+This repository contains de-identified metadata and analysis code associated with whole-genome sequencing (WGS) of third-generation cephalosporin-resistant *Klebsiella pneumoniae* isolates collected through the Tunisian Antimicrobial Resistance Surveillance System (TARSS).
 
-**Sequence data**
+These data were used for genomic epidemiological analyses presented in a PhD thesis at the London School of Hygiene & Tropical Medicine and in related research manuscripts.
+
+## Sequence data
 
 Raw sequencing reads are publicly available in the European Nucleotide Archive (ENA):
 
-BioProject: PRJEB98550
-https://www.ebi.ac.uk/ena/browser/view/PRJEB98550
+* **BioProject:** PRJEB98550
+* https://www.ebi.ac.uk/ena/browser/view/PRJEB98550
 
-The ENA archive contains the raw sequencing reads and associated accession numbers.
+The ENA archive contains raw sequencing reads and accession numbers for all isolates included in the study.
 
-This repository provides curated contextual metadata used for analysis and reproducibility.
+## Metadata availability
+
+This repository provides curated, de-identified metadata used for analysis and reproducibility
+
+To minimise the risk of re-identification, detailed patient-level information (e.g. exact dates, age, ward identifiers) is not publicly shared.
+
+## Code availability
+
+This repository also contains the analysis code used to generate the results and figures presented in the manuscript, including:
+
+* R scripts for data cleaning, statistical analysis, and visualization
+* Python scripts for gene detection and MLST calling
+
+The code is provided to support reproducibility of the analyses.
+
+## Requirements
+
+### R packages
+
+* dplyr, tidyr, ggplot2, patchwork, cowplot
+* AMRgen, DescTools, igraph, ggraph
+* readxl, writexl, stringi
+
+### Python
+
+* Python 3
+* pandas, pysam, biopython
+
+### External tools
+
+* bowtie2
+* samtools
+
+## Citation
+
+If you use these data or code, please cite the associated manuscript:
