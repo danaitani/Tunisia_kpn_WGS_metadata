@@ -1887,52 +1887,424 @@ message(" - Ward networks (PNGs): ", file.path(OUTDIR, "networks_by_ward"))
 # * 'cluster_stability_pairs.csv' → high agreement 15↔20 means stable clusters around your chosen threshold.
 
 
-########### The final code ################# this code doesnt include SHV or TEM 
+#Table 2 significance i used post-hoc
 suppressPackageStartupMessages({
-  library(dplyr); library(stringr); library(tidyr)
-  library(readxl); library(janitor); library/writexl; library(stringi)
+  library(dplyr)
+  library(purrr)
+  library(tidyr)
 })
 
-# ---------------- helpers ----------------
-core_id <- function(x){
+# Specimen totals from your table
+tot_spec <- c(Blood = 128, Urine = 158)
+
+# Enter present counts for Blood/Urine from your table
+genes_spec <- tibble::tribble(
+  ~Feature, ~Gene, ~Blood, ~Urine,
+  "ESBLs","Any ESBL",97,124,
+  "ESBLs","CTX-M-15",82,105,
+  "ESBLs","CTX-M-14",11,12,
+  "ESBLs","CTX-M-3",1,1,
+  "ESBLs","CTX-M-156",0,1,
+  "ESBLs","SHV mutation",2,3,
+  "ESBLs","TEM mutation",1,2,
+  
+  "Carbapenemase","Any carbapenemase",31,25,
+  "Carbapenemase","OXA-48-like family",22,21,
+  "Carbapenemase","OXA-48",22,20,
+  "Carbapenemase","OXA-204",0,1,
+  "Carbapenemase","NDM family",14,10,
+  "Carbapenemase","NDM-5",7,6,
+  "Carbapenemase","NDM-1",7,4,
+  
+  "AmpC beta-lactamase","Any AmpC",11,15,
+  "AmpC beta-lactamase","DHA",2,12,
+  "AmpC beta-lactamase","CMY",8,3,
+  "AmpC beta-lactamase","LAP",1,0,
+  
+  "Porin mutation","With ESBL",4,12,
+  "Porin mutation","With Carbapenemase",25,18,
+  
+  "None","No ESBL/carb/ampC/porin",19,18
+)
+
+analyze_gene_specimen <- function(Blood, Urine) {
+  present <- c(Blood = Blood, Urine = Urine)
+  absent  <- tot_spec - present
+  tab <- rbind(present, absent)  # 2x2
+  
+  # For 2x2, chi-square vs Fisher is mostly about sparse cells; Fisher is safe.
+  chi <- suppressWarnings(chisq.test(tab, correct = FALSE))
+  expected_issue <- any(chi$expected < 5) || any(tab < 5)
+  
+  p_chisq  <- chi$p.value
+  p_fisher <- fisher.test(tab)$p.value
+  p_used   <- if (expected_issue) p_fisher else p_chisq
+  test_used <- if (expected_issue) "Fisher" else "Chi-square"
+  
+  props <- present / tot_spec
+  higher <- names(props)[which.max(props)]
+  lower  <- names(props)[which.min(props)]
+  
+  tibble(
+    p_used = p_used,
+    test_used = test_used,
+    expected_issue = expected_issue,
+    higher = higher,
+    lower = lower
+  )
+}
+
+spec_results <- genes_spec %>%
+  mutate(res = pmap(list(Blood, Urine), analyze_gene_specimen)) %>%
+  unnest(res) %>%
+  mutate(
+    p_holm = p.adjust(p_used, method = "holm"),
+    Blood_fmt = sprintf("%d/%d (%.1f%%)", Blood, tot_spec["Blood"], 100*Blood/tot_spec["Blood"]),
+    Urine_fmt = sprintf("%d/%d (%.1f%%)", Urine, tot_spec["Urine"], 100*Urine/tot_spec["Urine"]),
+    p_used = signif(p_used, 3),
+    p_holm = signif(p_holm, 3)
+  ) %>%
+  arrange(p_holm) %>%
+  select(Feature, Gene, Blood_fmt, Urine_fmt, test_used, expected_issue, higher, lower, p_used, p_holm)
+
+spec_results
+write.csv(spec_results, "supp_table_gene_by_specimen_pvalues_holm.csv", row.names = FALSE)  
+
+# =============================================================================
+# Heatmap of common K. pneumoniae sublineages (SLs) across hospitals over time
+# Rule for inclusion:
+#   - at least 3 isolates in a hospital
+#   - present in at least 2 hospitals
+# Output:
+#   - 3-panel heatmap of within-hospital yearly prevalence by SL
+# =============================================================================
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(stringr)
+  library(ggplot2)
+  library(scales)
+  library(patchwork)
+  library(RColorBrewer)
+})
+
+# -----------------------------------------------------------------------------
+# 1. Parameters
+# -----------------------------------------------------------------------------
+
+min_isolates_per_hospital <- 3
+min_hospitals_required    <- 2
+
+
+output_file <- "Fig_heatmap_SL_by_hospital_PLOS.pdf"
+
+# -----------------------------------------------------------------------------
+# 2. Theme
+# -----------------------------------------------------------------------------
+
+theme_plos <- function(base_size = 9, base_family = "sans") {
+  theme_minimal(base_size = base_size, base_family = base_family) %+replace%
+    theme(
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      axis.ticks       = element_blank(),
+      axis.text.x      = element_text(angle = 45, hjust = 1, vjust = 1),
+      plot.title       = element_text(face = "bold"),
+      legend.title     = element_text(face = "bold"),
+      strip.text       = element_text(face = "bold")
+    )
+}
+
+# -----------------------------------------------------------------------------
+# 3. Clean and standardize input data
+# -----------------------------------------------------------------------------
+
+dat286_clean <- dat286 %>%
+  mutate(
+    Site = str_squish(site),
+    Year = as.character(year),
+    SL   = as.character(sl)
+  ) %>%
+  transmute(
+    Site,
+    Year,
+    SL
+  ) %>%
+  filter(!is.na(SL), !is.na(Site), !is.na(Year))
+
+# Optional sanity check
+print(table(dat286_clean$Site))
+
+# -----------------------------------------------------------------------------
+# 4. Identify common SLs
+#    Inclusion rule:
+#    - >= min_isolates_per_hospital isolates in a hospital
+#    - observed in >= min_hospitals_required hospitals
+# -----------------------------------------------------------------------------
+
+common_sls <- dat286_clean %>%
+  count(Site, SL, name = "n") %>%
+  filter(n >= min_isolates_per_hospital) %>%
+  count(SL, name = "n_hospitals_meeting_threshold") %>%
+  filter(n_hospitals_meeting_threshold >= min_hospitals_required) %>%
+  pull(SL) %>%
+  unique()
+
+if (length(common_sls) == 0) {
+  stop(
+    "No SLs met the inclusion rule: >= ",
+    min_isolates_per_hospital,
+    " isolates in at least ",
+    min_hospitals_required,
+    " hospitals."
+  )
+}
+
+# Order SLs globally by total frequency across all hospitals
+sl_order <- dat286_clean %>%
+  filter(SL %in% common_sls) %>%
+  count(SL, name = "n_total") %>%
+  arrange(desc(n_total), SL) %>%
+  pull(SL)
+
+# -----------------------------------------------------------------------------
+# 5. Prepare heatmap data for one hospital
+# -----------------------------------------------------------------------------
+
+prepare_heatmap_data <- function(data, hospital, sl_levels) {
+  years_present <- data %>%
+    filter(Site == hospital) %>%
+    pull(Year) %>%
+    unique() %>%
+    sort()
+  
+  if (length(years_present) == 0 || length(sl_levels) == 0) {
+    return(NULL)
+  }
+  
+  yearly_totals <- data %>%
+    filter(Site == hospital) %>%
+    count(Year, name = "total_site_year")
+  
+  sl_counts <- data %>%
+    filter(Site == hospital, SL %in% sl_levels) %>%
+    count(SL, Year, name = "count")
+  
+  expand_grid(
+    SL   = factor(sl_levels, levels = sl_levels),
+    Year = years_present
+  ) %>%
+    left_join(sl_counts, by = c("SL", "Year")) %>%
+    left_join(yearly_totals, by = "Year") %>%
+    mutate(
+      count = replace_na(count, 0L),
+      prev  = if_else(
+        is.na(total_site_year) | total_site_year == 0,
+        NA_real_,
+        count / total_site_year
+      )
+    )
+}
+
+# -----------------------------------------------------------------------------
+# 6. Plot function
+# -----------------------------------------------------------------------------
+
+plot_sl_heatmap <- function(data,
+                            hospital,
+                            panel_title,
+                            sl_levels,
+                            value = c("prev", "count"),
+                            annotate = TRUE) {
+  value <- match.arg(value)
+  
+  hm <- prepare_heatmap_data(data, hospital, sl_levels)
+  
+  if (is.null(hm) || nrow(hm) == 0) {
+    return(
+      ggplot() +
+        theme_void() +
+        labs(title = paste(panel_title, "(No data)"))
+    )
+  }
+  
+  if (value == "prev") {
+    p <- ggplot(hm, aes(x = Year, y = SL, fill = prev)) +
+      geom_tile(colour = "white", linewidth = 0.2, width = 0.95, height = 0.95)
+    
+    if (annotate) {
+      p <- p +
+        geom_text(
+          aes(label = case_when(
+            is.na(prev) ~ "",
+            prev == 0   ~ "0%",
+            TRUE        ~ percent(prev, accuracy = 1)
+          )),
+          size = 2
+        )
+    }
+    
+    p <- p +
+      scale_fill_gradientn(
+        colours  = c("#FFFFFF", brewer.pal(8, "Reds")),
+        values   = rescale(c(0, 0.10, 0.30, 1)),
+        limits   = c(0, 1),
+        labels   = percent_format(accuracy = 1),
+        na.value = "grey95",
+        name     = "Prevalence\n(within hospital & year)"
+      )
+  } else {
+    max_count <- max(hm$count, na.rm = TRUE)
+    
+    p <- ggplot(hm, aes(x = Year, y = SL, fill = count)) +
+      geom_tile(colour = "white", linewidth = 0.2, width = 0.95, height = 0.95)
+    
+    if (annotate) {
+      p <- p +
+        geom_text(
+          aes(label = if_else(count == 0, "", as.character(count))),
+          size = 2.5
+        )
+    }
+    
+    p <- p +
+      scale_fill_gradient(
+        low      = "#FEE5D9",
+        high     = "#A50F15",
+        limits   = c(0, max_count),
+        na.value = "grey95",
+        name     = "Isolate count"
+      )
+  }
+  
+  p +
+    labs(
+      title = panel_title,
+      x = "Year",
+      y = "Sublineage (SL)"
+    ) +
+    theme_plos()
+}
+
+# -----------------------------------------------------------------------------
+# 7. Generate hospital panels
+# -----------------------------------------------------------------------------
+
+p_A <- plot_sl_heatmap(
+  data       = dat286_clean,
+  hospital   = "Hospital A",
+  panel_title = hospital_labels["Hospital A"],
+  sl_levels  = sl_order,
+  value      = "prev"
+)
+
+p_B <- plot_sl_heatmap(
+  data       = dat286_clean,
+  hospital   = "Hospital B",
+  panel_title = hospital_labels["Hospital B"],
+  sl_levels  = sl_order,
+  value      = "prev"
+)
+
+p_C <- plot_sl_heatmap(
+  data       = dat286_clean,
+  hospital   = "Hospital C",
+  panel_title = hospital_labels["Hospital C"],
+  sl_levels  = sl_order,
+  value      = "prev"
+)
+
+# -----------------------------------------------------------------------------
+# 8. Combine figure
+# -----------------------------------------------------------------------------
+
+plos_fig <- (p_A + p_B + p_C) +
+  plot_layout(ncol = 3, guides = "collect") &
+  theme(legend.position = "right")
+
+plos_fig
+
+# -----------------------------------------------------------------------------
+# 9. Save output
+# -----------------------------------------------------------------------------
+
+ggsave(
+  filename = output_file,
+  plot     = plos_fig,
+  width    = 180,
+  height   = 90,
+  units    = "mm"
+)
+
+# =============================================================================
+# Mechanism rules and supplementary significance testing
+# Anonymised hospital labels used in all outputs:
+#   CHBH      -> Hospital A
+#   La Rabta  -> Hospital B
+#   TCB       -> Hospital C
+# =============================================================================
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(stringr)
+  library(tidyr)
+  library(readxl)
+  library(janitor)
+  library(writexl)
+  library(stringi)
+  library(purrr)
+  library(tibble)
+})
+
+# -----------------------------------------------------------------------------
+# 1. Helpers
+# -----------------------------------------------------------------------------
+
+core_id <- function(x) {
   s <- as.character(x)
   s <- gsub("^PID-\\d+-", "", s, ignore.case = TRUE)
   s <- gsub("_S\\d+.*$", "", s, ignore.case = TRUE)
   trimws(s)
 }
-coalesce_cols_chr <- function(df, candidates){
+
+coalesce_cols_chr <- function(df, candidates) {
   cols <- intersect(candidates, names(df))
   if (!length(cols)) return(rep(NA_character_, nrow(df)))
+  
   out <- as.character(df[[cols[1]]])
-  if (length(cols) > 1) for (nm in cols[-1]) out <- dplyr::coalesce(out, as.character(df[[nm]]))
+  if (length(cols) > 1) {
+    for (nm in cols[-1]) {
+      out <- dplyr::coalesce(out, as.character(df[[nm]]))
+    }
+  }
   out
 }
 
-# Unicode-robust normaliser for gene strings (keep only one definition)
-norm_ctx_text <- function(v){
-  x <- as.character(v); x[is.na(x)] <- ""
-  x <- stringi::stri_trans_nfkc(x)                                # canonicalise
-  x <- stringi::stri_replace_all_regex(x, "[\\p{Cf}\\p{Cc}]", "") # strip format/control (ZWSP, SHY…)
-  x <- stringi::stri_replace_all_regex(x, "\\p{Z}+", " ")         # collapse spaces
-  x <- stringi::stri_replace_all_regex(x, "[\\p{Pd}]", "-")       # any dash -> '-'
-  x <- chartr("\u039C\u00B5\u0421\u0422\u0425\u041C", "MMCTXM", x) # Greek μ/M, Cyrillic C/T/X/M
-  x <- stringi::stri_replace_all_regex(x, "[*^?]", "")            # strip ornaments
+norm_ctx_text <- function(v) {
+  x <- as.character(v)
+  x[is.na(x)] <- ""
+  x <- stringi::stri_trans_nfkc(x)
+  x <- stringi::stri_replace_all_regex(x, "[\\p{Cf}\\p{Cc}]", "")
+  x <- stringi::stri_replace_all_regex(x, "\\p{Z}+", " ")
+  x <- stringi::stri_replace_all_regex(x, "[\\p{Pd}]", "-")
+  x <- chartr("\u039C\u00B5\u0421\u0422\u0425\u041C", "MMCTXM", x)
+  x <- stringi::stri_replace_all_regex(x, "[*^?]", "")
   toupper(x)
 }
 
-# Extract clean CTX-M tokens (e.g. "CTX-M-103;CTX-M-114"), empty "" if none
-extract_ctxm_tokens <- function(v){
+extract_ctxm_tokens <- function(v) {
   x <- norm_ctx_text(v)
   hits <- stringi::stri_extract_all_regex(x, "(?iu)CTX[-_ ]?M[-_ ]?\\d+")
-  vapply(hits, function(h){
+  vapply(hits, function(h) {
     h <- unique(h[!is.na(h)])
     if (length(h)) paste(h, collapse = ";") else ""
   }, character(1))
 }
 
-# NA-safe, Unicode/dash-robust CTX-M presence detector
-has_ctxm <- function(v){
-  x <- as.character(v); x[is.na(x)] <- ""
+has_ctxm <- function(v) {
+  x <- as.character(v)
+  x[is.na(x)] <- ""
   x <- stringi::stri_trans_nfkc(x)
   x <- stringi::stri_replace_all_regex(x, "[\\p{Cf}\\p{Cc}]", "")
   x <- stringi::stri_replace_all_regex(x, "\\p{Z}+", " ")
@@ -1942,66 +2314,120 @@ has_ctxm <- function(v){
   stringi::stri_detect_regex(x, "(?iu)CTX\\s*[-_]?\\s*M")
 }
 
-sir_norm <- function(x){
+sir_norm <- function(x) {
   y <- toupper(trimws(as.character(x)))
   y <- gsub("[\\*\\^\\?\\+]+$", "", y)
-  y[!y %in% c("S","I","R")] <- NA_character_
+  y[!y %in% c("S", "I", "R")] <- NA_character_
   y
 }
 
-# Paste & normalise multiple columns
-paste_cols_norm <- function(d, cols){
+paste_cols_norm <- function(d, cols) {
   cols <- intersect(cols, names(d))
   if (!length(cols)) return(rep(NA_character_, nrow(d)))
+  
   m <- as.data.frame(lapply(d[cols], norm_ctx_text))
-  txt <- do.call(paste, c(m, list(sep=";")))
+  txt <- do.call(paste, c(m, list(sep = ";")))
   txt[txt %in% c("", "NA")] <- NA
   txt
 }
 
-# ---------------- unified ID + dedup BEFORE rules ----------------
+anon_hospital <- function(x) {
+  case_when(
+    x == "CHBH" ~ "Hospital A",
+    x == "La Rabta" ~ "Hospital B",
+    x == "TCB" ~ "Hospital C",
+    TRUE ~ NA_character_
+  )
+}
+
+# -----------------------------------------------------------------------------
+# 2. Unified ID and de-duplication
+# -----------------------------------------------------------------------------
+
 dat0 <- dat_withrescued %>%
   mutate(
-    id_unified      = coalesce_cols_chr(., c("id_export","id","genome_id","sample","strain","isolate","isolate_id")),
+    id_unified = coalesce_cols_chr(
+      .,
+      c("id_export", "id", "genome_id", "sample", "strain", "isolate", "isolate_id")
+    ),
     id_core_unified = core_id(id_unified)
   )
 
 has_rescue_col <- "rescue_all_genes_genes" %in% names(dat0)
+
 dat1 <- dat0 %>%
-  arrange(desc(if (has_rescue_col) !is.na(.data[["rescue_all_genes_genes"]]) else FALSE),
-          id_core_unified, id_unified) %>%
+  arrange(
+    desc(if (has_rescue_col) !is.na(.data[["rescue_all_genes_genes"]]) else FALSE),
+    id_core_unified,
+    id_unified
+  ) %>%
   distinct(id_core_unified, .keep_all = TRUE)
 
-# ---------------- rule sources ----------------
-r1 <- c("bla_esbl_acquired","truncated_resistance_hits","spurious_resistance_hits",
-        "rescue_esbl_list","rescue_all_genes_genes")   # ESBL = CTX-M only
-r2 <- c("bla_carb_acquired","rescue_carb_list","rescue_carb_family",
-        "rescue_klebsiella_pneumo_complex_amr_bla_carb_acquired")
-r3 <- c("omp_mutations","rescue_klebsiella_pneumo_complex_amr_omp_mutations")
-r4 <- c("bla_acquired","klebsiella_pneumo_complex__amr__bla_acquired","beta_lactam_genes_final",
-        "rescue_beta_lactam_genes","rescue_all_genes_genes",
-        "rescue_klebsiella_pneumo_complex_amr_bla_acquired")
+# -----------------------------------------------------------------------------
+# 3. Rule source columns
+# -----------------------------------------------------------------------------
 
-# ---------------- CTX-M detection (NA-safe & unified) ----------------
+r1 <- c(
+  "bla_esbl_acquired", "truncated_resistance_hits", "spurious_resistance_hits",
+  "rescue_esbl_list", "rescue_all_genes_genes"
+)
+
+r2 <- c(
+  "bla_carb_acquired", "rescue_carb_list", "rescue_carb_family",
+  "rescue_klebsiella_pneumo_complex_amr_bla_carb_acquired"
+)
+
+r3 <- c(
+  "omp_mutations", "rescue_klebsiella_pneumo_complex_amr_omp_mutations"
+)
+
+r4 <- c(
+  "bla_acquired", "klebsiella_pneumo_complex__amr__bla_acquired",
+  "beta_lactam_genes_final", "rescue_beta_lactam_genes",
+  "rescue_all_genes_genes", "rescue_klebsiella_pneumo_complex_amr_bla_acquired"
+)
+
+# -----------------------------------------------------------------------------
+# 4. CTX-M detection
+# -----------------------------------------------------------------------------
+
 dat1 <- dat1 %>%
   mutate(
-    # tokens (for reporting)
     ctxm_trunc_tok_raw = extract_ctxm_tokens(.data[["truncated_resistance_hits"]]),
     ctxm_spur_tok_raw  = extract_ctxm_tokens(.data[["spurious_resistance_hits"]]),
     
-    # robust boolean hits per column
-    hit_bla_esbl_acquired      = if ("bla_esbl_acquired" %in% names(.))      has_ctxm(.data[["bla_esbl_acquired"]])           else FALSE,
-    hit_truncated_resistance_hits = if ("truncated_resistance_hits" %in% names(.)) has_ctxm(.data[["truncated_resistance_hits"]]) else FALSE,
-    hit_spurious_resistance_hits  = if ("spurious_resistance_hits" %in% names(.))  has_ctxm(.data[["spurious_resistance_hits"]])  else FALSE,
-    hit_rescue_esbl_list       = if ("rescue_esbl_list" %in% names(.))       has_ctxm(.data[["rescue_esbl_list"]])            else FALSE,
-    hit_rescue_all_genes_genes = if ("rescue_all_genes_genes" %in% names(.)) has_ctxm(.data[["rescue_all_genes_genes"]])      else FALSE,
+    hit_bla_esbl_acquired = if ("bla_esbl_acquired" %in% names(.)) {
+      has_ctxm(.data[["bla_esbl_acquired"]])
+    } else FALSE,
     
-    # final tokens (use generic 'CTX-M' if digits absent but presence detected)
-    ctxm_truncated_tokens = ifelse(ctxm_trunc_tok_raw == "" & hit_truncated_resistance_hits, "CTX-M", ctxm_trunc_tok_raw),
-    ctxm_spurious_tokens  = ifelse(ctxm_spur_tok_raw  == "" & hit_spurious_resistance_hits,  "CTX-M", ctxm_spur_tok_raw)
+    hit_truncated_resistance_hits = if ("truncated_resistance_hits" %in% names(.)) {
+      has_ctxm(.data[["truncated_resistance_hits"]])
+    } else FALSE,
+    
+    hit_spurious_resistance_hits = if ("spurious_resistance_hits" %in% names(.)) {
+      has_ctxm(.data[["spurious_resistance_hits"]])
+    } else FALSE,
+    
+    hit_rescue_esbl_list = if ("rescue_esbl_list" %in% names(.)) {
+      has_ctxm(.data[["rescue_esbl_list"]])
+    } else FALSE,
+    
+    hit_rescue_all_genes_genes = if ("rescue_all_genes_genes" %in% names(.)) {
+      has_ctxm(.data[["rescue_all_genes_genes"]])
+    } else FALSE,
+    
+    ctxm_truncated_tokens = ifelse(
+      ctxm_trunc_tok_raw == "" & hit_truncated_resistance_hits,
+      "CTX-M",
+      ctxm_trunc_tok_raw
+    ),
+    ctxm_spurious_tokens = ifelse(
+      ctxm_spur_tok_raw == "" & hit_spurious_resistance_hits,
+      "CTX-M",
+      ctxm_spur_tok_raw
+    )
   )
 
-# NA-safe rowwise OR across all CTX-M sources
 esbl_hits_mat <- cbind(
   dat1$hit_bla_esbl_acquired,
   dat1$hit_truncated_resistance_hits,
@@ -2009,9 +2435,13 @@ esbl_hits_mat <- cbind(
   dat1$hit_rescue_esbl_list,
   dat1$hit_rescue_all_genes_genes
 )
+
 dat1$esbl_ctxm_any <- rowSums(as.matrix(esbl_hits_mat), na.rm = TRUE) > 0
 
-# ---------------- other rules ----------------
+# -----------------------------------------------------------------------------
+# 5. Other mechanism rules
+# -----------------------------------------------------------------------------
+
 txt_r2 <- paste_cols_norm(dat1, r2)
 txt_r3 <- paste_cols_norm(dat1, r3)
 txt_r4 <- paste_cols_norm(dat1, r4)
@@ -2023,67 +2453,269 @@ pat_ampc  <- regex("\\b(DHA|CMY|LAP)\\b", ignore_case = TRUE)
 carb_any  <- !is.na(txt_r2) & str_detect(txt_r2, pat_carb)
 porin_txt <- !is.na(txt_r3) & str_detect(txt_r3, pat_porin)
 
-omp_flag_cols <- intersect(c("rescue_omp_k35_trunc","rescue_omp_k35_fs",
-                             "rescue_omp_k36_trunc","rescue_omp_k36_fs",
-                             "rescue_omp_k36_l3_g_dins"), names(dat1))
+omp_flag_cols <- intersect(
+  c(
+    "rescue_omp_k35_trunc", "rescue_omp_k35_fs",
+    "rescue_omp_k36_trunc", "rescue_omp_k36_fs",
+    "rescue_omp_k36_l3_g_dins"
+  ),
+  names(dat1)
+)
 
-# robust coercion for porin flag columns that may be 1/TRUE/"TRUE"/"1"/yes
 porin_flags <- if (length(omp_flag_cols)) {
-  rowSums(as.data.frame(lapply(dat1[omp_flag_cols], function(z){
+  rowSums(as.data.frame(lapply(dat1[omp_flag_cols], function(z) {
     vz <- tolower(as.character(z))
-    (vz %in% c("1","true","t","yes","y")) | suppressWarnings(as.numeric(vz) == 1)
+    (vz %in% c("1", "true", "t", "yes", "y")) |
+      suppressWarnings(as.numeric(vz) == 1)
   })), na.rm = TRUE) > 0
-} else FALSE
+} else {
+  FALSE
+}
 
 porin_any <- porin_txt | porin_flags
 ampc_any  <- !is.na(txt_r4) & str_detect(txt_r4, pat_ampc)
 
-# ---------------- assemble ----------------
+# -----------------------------------------------------------------------------
+# 6. Assemble mechanism table
+# -----------------------------------------------------------------------------
+
 dat_rules <- dat1 %>%
   mutate(
-    # report normalised CTX-M tokens from TRUNC/SPUR
-    ctxm_from_trunc_or_spur = na_if(paste0(
-      ifelse(ctxm_truncated_tokens != "", ctxm_truncated_tokens, ""),
-      ifelse(ctxm_truncated_tokens != "" & ctxm_spurious_tokens != "", ";", ""),
-      ifelse(ctxm_spurious_tokens  != "", ctxm_spurious_tokens, "")
-    ), ""),
-    
-    carb_any      = carb_any,
-    porin_any     = porin_any,
-    ampc_any      = ampc_any,
-    
-    mech_rules = apply(cbind(esbl_ctxm_any, carb_any, porin_any, ampc_any), 1, function(v){
-      labs <- c("ESBL_CTXM","CARB","PORIN","AMPC")[which(v)]
-      if (length(labs) == 0) "none" else paste(labs, collapse = " + ")
-    })
+    ctxm_from_trunc_or_spur = na_if(
+      paste0(
+        ifelse(ctxm_truncated_tokens != "", ctxm_truncated_tokens, ""),
+        ifelse(ctxm_truncated_tokens != "" & ctxm_spurious_tokens != "", ";", ""),
+        ifelse(ctxm_spurious_tokens != "", ctxm_spurious_tokens, "")
+      ),
+      ""
+    ),
+    carb_any  = carb_any,
+    porin_any = porin_any,
+    ampc_any  = ampc_any,
+    mech_rules = apply(
+      cbind(esbl_ctxm_any, carb_any, porin_any, ampc_any),
+      1,
+      function(v) {
+        labs <- c("ESBL_CTXM", "CARB", "PORIN", "AMPC")[which(v)]
+        if (length(labs) == 0) "none" else paste(labs, collapse = " + ")
+      }
+    )
   )
 
+# -----------------------------------------------------------------------------
+# 7. Export anonymised mechanism flags
+# -----------------------------------------------------------------------------
 
-# ---------------- export ----------------
 mechanism_flags <- dat_rules %>%
-  mutate(id = dplyr::coalesce(id_export, id, genome_id)) %>%
-  select(id_core_unified, id, site, year = dplyr::any_of("year"),
-         pheno_3gc,
-         esbl_ctxm_any, carb_any, porin_any, ampc_any, mech_rules,
-         starts_with("hit_"), ctxm_from_trunc_or_spur)
+  mutate(
+    id = dplyr::coalesce(id_export, id, genome_id),
+    site_anon = anon_hospital(site)
+  ) %>%
+  select(
+    id_core_unified, id, site = site_anon, year = dplyr::any_of("year"),
+    pheno_3gc,
+    esbl_ctxm_any, carb_any, porin_any, ampc_any, mech_rules,
+    starts_with("hit_"), ctxm_from_trunc_or_spur
+  )
 
-not_matching_full <- dat_rules %>% filter(mech_rules == "none")
+not_matching_full <- dat_rules %>%
+  mutate(site = anon_hospital(site)) %>%
+  filter(mech_rules == "none")
 
-writexl::write_xlsx(
+write_xlsx(
   list(
-    Mechanism_flags       = mechanism_flags,
+    Mechanism_flags = mechanism_flags,
     Not_matching_FULLDATA = not_matching_full
   ),
-  "Mechanism_rules_CTXM_NO_THRESHOLD_dedup.xlsx"
+  "Mechanism_rules_CTXM_NO_THRESHOLD_dedup_anonymised.xlsx"
 )
 
-message("Mechanism CTX-M total = ", sum(dat_rules$esbl_ctxm_any, na.rm=TRUE), " of ", nrow(dat_rules))
-message("CTX-M hits — bla_esbl=", sum(dat_rules$hit_bla_esbl_acquired,      na.rm=TRUE),
-        ", truncated=",            sum(dat_rules$hit_truncated_resistance_hits, na.rm=TRUE),
-        ", spurious=",             sum(dat_rules$hit_spurious_resistance_hits,  na.rm=TRUE),
-        ", rescue_esbl=",          sum(dat_rules$hit_rescue_esbl_list,          na.rm=TRUE),
-        ", rescue_all=",           sum(dat_rules$hit_rescue_all_genes_genes,    na.rm=TRUE))
+message(
+  "Mechanism CTX-M total = ",
+  sum(dat_rules$esbl_ctxm_any, na.rm = TRUE),
+  " of ",
+  nrow(dat_rules)
+)
 
+message(
+  "CTX-M hits — bla_esbl = ", sum(dat_rules$hit_bla_esbl_acquired, na.rm = TRUE),
+  ", truncated = ", sum(dat_rules$hit_truncated_resistance_hits, na.rm = TRUE),
+  ", spurious = ", sum(dat_rules$hit_spurious_resistance_hits, na.rm = TRUE),
+  ", rescue_esbl = ", sum(dat_rules$hit_rescue_esbl_list, na.rm = TRUE),
+  ", rescue_all = ", sum(dat_rules$hit_rescue_all_genes_genes, na.rm = TRUE)
+)
 
+# -----------------------------------------------------------------------------
+# 8. Supplementary Table: gene by hospital significance
+#    Anonymised hospital names only
+# -----------------------------------------------------------------------------
+
+totals_hosp <- c(
+  hospital_a = 127,
+  hospital_b = 96,
+  hospital_c = 63
+)
+
+genes_hosp <- tribble(
+  ~Feature, ~Gene, ~hospital_a, ~hospital_b, ~hospital_c,
+  "ESBLs", "Any ESBL", 112, 68, 41,
+  "ESBLs", "CTX-M-15", 102, 48, 37,
+  "ESBLs", "CTX-M-14", 1, 20, 2,
+  "ESBLs", "CTX-M-3", 2, 0, 0,
+  "ESBLs", "CTX-M-156", 1, 0, 0,
+  "ESBLs", "SHV mutation", 5, 0, 0,
+  "ESBLs", "TEM mutation", 1, 0, 2,
+  "Carbapenemase", "Any carbapenemase", 5, 40, 11,
+  "Carbapenemase", "OXA-48-like family", 0, 33, 10,
+  "Carbapenemase", "OXA-48", 0, 32, 10,
+  "Carbapenemase", "OXA-204", 0, 1, 0,
+  "Carbapenemase", "NDM family", 5, 18, 1,
+  "Carbapenemase", "NDM-5", 0, 12, 1,
+  "Carbapenemase", "NDM-1", 5, 6, 0,
+  "AmpC", "Any AmpC", 6, 7, 13,
+  "AmpC", "DHA", 5, 3, 6,
+  "AmpC", "CMY", 1, 4, 6,
+  "AmpC", "LAP", 0, 0, 1,
+  "Porin", "With ESBL", 3, 11, 2,
+  "Porin", "With Carbapenemase", 1, 33, 9,
+  "None", "No mechanism", 14, 10, 13
+)
+
+analyze_gene_hospital <- function(hospital_a, hospital_b, hospital_c) {
+  present <- c(
+    hospital_a = hospital_a,
+    hospital_b = hospital_b,
+    hospital_c = hospital_c
+  )
+  
+  absent <- totals_hosp - present
+  tab <- rbind(present, absent)
+  
+  chi <- suppressWarnings(chisq.test(tab))
+  expected_issue <- any(chi$expected < 5)
+  
+  global_p <- if (expected_issue) fisher.test(tab)$p.value else chi$p.value
+  
+  pairs <- list(
+    c("hospital_a", "hospital_b"),
+    c("hospital_a", "hospital_c"),
+    c("hospital_b", "hospital_c")
+  )
+  
+  pairwise_p <- map_dbl(pairs, function(p) {
+    p_tab <- rbind(present[p], absent[p])
+    fisher.test(p_tab)$p.value
+  })
+  
+  pairwise_holm <- p.adjust(pairwise_p, method = "holm")
+  
+  props <- present / totals_hosp
+  highest <- names(props)[which.max(props)]
+  lowest  <- names(props)[which.min(props)]
+  
+  tibble(
+    global_p = global_p,
+    hospital_a_vs_b = pairwise_holm[1],
+    hospital_a_vs_c = pairwise_holm[2],
+    hospital_b_vs_c = pairwise_holm[3],
+    highest = highest,
+    lowest = lowest
+  )
+}
+
+results_hosp <- genes_hosp %>%
+  mutate(
+    res = pmap(list(hospital_a, hospital_b, hospital_c), analyze_gene_hospital)
+  ) %>%
+  unnest(res) %>%
+  mutate(
+    global_p_holm = p.adjust(global_p, method = "holm")
+  ) %>%
+  arrange(global_p_holm)
+
+write.csv(
+  results_hosp,
+  "supp_table_gene_by_hospital_pvalues_holm_anonymised.csv",
+  row.names = FALSE
+)
+
+# -----------------------------------------------------------------------------
+# 9. Supplementary Table: gene by specimen significance
+# -----------------------------------------------------------------------------
+
+tot_spec <- c(Blood = 128, Urine = 158)
+
+genes_spec <- tribble(
+  ~Feature, ~Gene, ~Blood, ~Urine,
+  "ESBLs", "Any ESBL", 97, 124,
+  "ESBLs", "CTX-M-15", 82, 105,
+  "ESBLs", "CTX-M-14", 11, 12,
+  "ESBLs", "CTX-M-3", 1, 1,
+  "ESBLs", "CTX-M-156", 0, 1,
+  "ESBLs", "SHV mutation", 2, 3,
+  "ESBLs", "TEM mutation", 1, 2,
+  "Carbapenemase", "Any carbapenemase", 31, 25,
+  "Carbapenemase", "OXA-48-like family", 22, 21,
+  "Carbapenemase", "OXA-48", 22, 20,
+  "Carbapenemase", "OXA-204", 0, 1,
+  "Carbapenemase", "NDM family", 14, 10,
+  "Carbapenemase", "NDM-5", 7, 6,
+  "Carbapenemase", "NDM-1", 7, 4,
+  "AmpC beta-lactamase", "Any AmpC", 11, 15,
+  "AmpC beta-lactamase", "DHA", 2, 12,
+  "AmpC beta-lactamase", "CMY", 8, 3,
+  "AmpC beta-lactamase", "LAP", 1, 0,
+  "Porin mutation", "With ESBL", 4, 12,
+  "Porin mutation", "With Carbapenemase", 25, 18,
+  "None", "No ESBL/carb/ampC/porin", 19, 18
+)
+
+analyze_gene_specimen <- function(Blood, Urine) {
+  present <- c(Blood = Blood, Urine = Urine)
+  absent  <- tot_spec - present
+  tab <- rbind(present, absent)
+  
+  chi <- suppressWarnings(chisq.test(tab, correct = FALSE))
+  expected_issue <- any(chi$expected < 5) || any(tab < 5)
+  
+  p_chisq  <- chi$p.value
+  p_fisher <- fisher.test(tab)$p.value
+  p_used   <- if (expected_issue) p_fisher else p_chisq
+  test_used <- if (expected_issue) "Fisher" else "Chi-square"
+  
+  props <- present / tot_spec
+  higher <- names(props)[which.max(props)]
+  lower  <- names(props)[which.min(props)]
+  
+  tibble(
+    p_used = p_used,
+    test_used = test_used,
+    expected_issue = expected_issue,
+    higher = higher,
+    lower = lower
+  )
+}
+
+spec_results <- genes_spec %>%
+  mutate(res = pmap(list(Blood, Urine), analyze_gene_specimen)) %>%
+  unnest(res) %>%
+  mutate(
+    p_holm = p.adjust(p_used, method = "holm"),
+    Blood_fmt = sprintf("%d/%d (%.1f%%)", Blood, tot_spec["Blood"], 100 * Blood / tot_spec["Blood"]),
+    Urine_fmt = sprintf("%d/%d (%.1f%%)", Urine, tot_spec["Urine"], 100 * Urine / tot_spec["Urine"]),
+    p_used = signif(p_used, 3),
+    p_holm = signif(p_holm, 3)
+  ) %>%
+  arrange(p_holm) %>%
+  select(
+    Feature, Gene, Blood_fmt, Urine_fmt,
+    test_used, expected_issue, higher, lower, p_used, p_holm
+  )
+
+write.csv(
+  spec_results,
+  "supp_table_gene_by_specimen_pvalues_holm.csv",
+  row.names = FALSE
+)
 
 
