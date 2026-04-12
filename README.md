@@ -51,3 +51,6 @@ The code is provided to support reproducibility of the analyses.
 ## Citation
 
 If you use these data or code, please cite the associated manuscript:
+
+Itani D, Smaoui H, Thabet L, Zribi M, Dhraief S, Kanzari L, et al. Genomic Surveillance of Third-Generation Cephalosporin-Resistant Klebsiella pneumoniae in Tunisian AMR Surveillance System Hospitals [Internet]. medRxiv; 2026 [cited 2026 Apr 11]. p. 2026.04.08.26350452. Available from: https://www.medrxiv.org/content/10.64898/2026.04.08.26350452v1 doi:10.64898/2026.04.08.26350452
+
